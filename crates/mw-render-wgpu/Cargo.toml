@@ -1,0 +1,9 @@
+[package]
+name = "mw-render-wgpu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow.workspace = true
+mw-core = { path = "../mw-core" }
+wgpu.workspace = true
