@@ -1,0 +1,10 @@
+[package]
+name = "web-viewer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mw-core = { path = "../../crates/mw-core" }
+mw-render-wgpu = { path = "../../crates/mw-render-wgpu" }
+mw-telemetry = { path = "../../crates/mw-telemetry" }
+log.workspace = true
