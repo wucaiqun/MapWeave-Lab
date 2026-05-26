@@ -996,6 +996,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "instant"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0242819d153cba4b4b05a5a8f2a7e9bbf97b6055b2a002b395c96b5ff3c0222"
+dependencies = [
+ "cfg-if",
+ "js-sys",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1317,6 +1329,7 @@ name = "mw-render-wgpu"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "mw-core",
  "wgpu",
 ]
@@ -1362,11 +1375,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "glam",
+ "instant",
  "log",
  "mw-core",
  "mw-provider-mvt",
  "mw-render-wgpu",
  "mw-telemetry",
+ "pollster",
+ "tokio",
  "wgpu",
  "winit",
 ]
@@ -1782,6 +1798,12 @@ dependencies = [
  "rustix 1.1.4",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "pollster"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3"
 
 [[package]]
 name = "portable-atomic"

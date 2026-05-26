@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{RoadFeature, TileId};
+use crate::{PolygonFeature, RoadFeature, TileId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LayerKind {
@@ -13,13 +13,8 @@ pub enum LayerKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BackgroundLayerData {
-    pub color_rgba: [f32; 4],
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LayerPayload {
-    Background(BackgroundLayerData),
+    Background(Vec<PolygonFeature>),
     Roads(Vec<RoadFeature>),
     Empty,
 }

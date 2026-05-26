@@ -7,6 +7,7 @@ edition = "2024"
 anyhow.workspace = true
 glam.workspace = true
 pollster = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread"] }
 mw-core = { path = "../../crates/mw-core" }
 mw-provider-mvt = { path = "../../crates/mw-provider-mvt" }
 mw-render-wgpu = { path = "../../crates/mw-render-wgpu" }
@@ -14,3 +15,6 @@ mw-telemetry = { path = "../../crates/mw-telemetry" }
 log.workspace = true
 wgpu.workspace = true
 winit = "0.30"
+instant = "0.1"
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+instant = { version = "0.1", features = [ "wasm-bindgen" ] }

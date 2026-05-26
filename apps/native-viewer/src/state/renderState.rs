@@ -2,6 +2,8 @@ use anyhow::Context;
 use std::sync::Arc;
 use winit::dpi::PhysicalSize;
 
+use mw_render_wgpu::{FrameUniforms, Renderer};
+
 pub struct RenderState {
     #[allow(dead_code)]
     instance: wgpu::Instance,
@@ -79,7 +81,19 @@ impl RenderState {
         self.reconfigure_surface();
     }
 
-    pub fn render(&mut self) {
+    pub fn surface_format(&self) -> wgpu::TextureFormat {
+        self.config.format
+    }
+
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    pub fn render(&mut self, renderer: &Renderer, clear_color: wgpu::Color, frame: &FrameUniforms) {
         let output = match self.surface.get_current_texture() {
             Ok(o) => o,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -100,19 +114,14 @@ impl RenderState {
         });
 
         {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("clear"),
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("frame"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.02,
-                            g: 0.02,
-                            b: 0.08,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -120,6 +129,8 @@ impl RenderState {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
+
+            renderer.render(&mut pass, &self.queue, frame);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));

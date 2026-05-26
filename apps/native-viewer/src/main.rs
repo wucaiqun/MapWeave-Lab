@@ -56,12 +56,15 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 if let Some(state) = self.state.as_mut() {
-                    state.update();
                     state.render();
                 }
             }
             WindowEvent::CloseRequested => event_loop.exit(),
-            _ => {}
+            event => {
+                if let Some(state) = self.state.as_mut() {
+                    state.handle_window_event(&event);
+                }
+            }
         }
     }
 }

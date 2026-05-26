@@ -1,5 +1,7 @@
+mod frame;
 mod layer;
 mod renderer;
 
-pub use layer::{BackgroundLayer, RenderLayer};
+pub use frame::FrameUniforms;
+pub use layer::{BackgroundLayer, RenderLayer, RoadsLayer};
 pub use renderer::{Renderer, RendererConfig};
