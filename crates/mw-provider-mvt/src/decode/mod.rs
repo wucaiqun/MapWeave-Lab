@@ -58,7 +58,7 @@ fn decode_road_feature(
         id: feature.id.unwrap_or_default(),
         class: decode_feature_class(layer, feature),
         source_layer: source_layer.to_string(),
-        points_lon_lat: points,
+        points_tile: points,
     })
 }
 

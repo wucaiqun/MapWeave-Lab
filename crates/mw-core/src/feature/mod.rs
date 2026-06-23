@@ -18,7 +18,7 @@ pub struct RoadFeature {
     pub id: u64,
     pub class: String,
     pub source_layer: String,
-    pub points_lon_lat: Vec<[f64; 2]>,
+    pub points_tile: Vec<[f64; 2]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

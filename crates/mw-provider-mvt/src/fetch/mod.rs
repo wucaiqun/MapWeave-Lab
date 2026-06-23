@@ -5,6 +5,35 @@ use std::path::PathBuf;
 
 use crate::MvtProviderConfig;
 
+pub async fn resolve_endpoint_template(config: &mut MvtProviderConfig) -> Result<()> {
+    let Some(tilejson_url) = config.tilejson_url.clone() else {
+        if config.endpoint_template.is_empty() {
+            return Err(anyhow!("endpoint_template is empty and no tilejson_url was provided"));
+        }
+        return Ok(());
+    };
+
+    let response = reqwest::get(&tilejson_url).await?;
+    if !response.status().is_success() {
+        return Err(anyhow!(
+            "failed to fetch TileJSON: {} from {}",
+            response.status(),
+            tilejson_url
+        ));
+    }
+
+    let json: serde_json::Value = response.json().await?;
+    let template = json
+        .get("tiles")
+        .and_then(|tiles| tiles.as_array())
+        .and_then(|tiles| tiles.first())
+        .and_then(|tile| tile.as_str())
+        .ok_or_else(|| anyhow!("TileJSON at {tilejson_url} has no tiles[] URL template"))?;
+
+    config.endpoint_template = template.to_string();
+    Ok(())
+}
+
 pub fn build_tile_url(config: &MvtProviderConfig, tile_id: TileId) -> String {
     config
         .endpoint_template
@@ -77,13 +106,16 @@ pub async fn fetch_tile_bytes(config: &MvtProviderConfig, tile_id: TileId) -> Re
     }
     let response = reqwest::get(&url).await?;
     if !response.status().is_success() {
-        let message = format!("failed to fetch tile: {}", response.status());
+        let message = format!("failed to fetch tile: {} at {}", response.status(), url);
         print_error(&message);
         return Err(anyhow!(message));
     }
 
     let bytes = response.bytes().await?;
     let bytes = bytes.to_vec();
+    if bytes.is_empty() {
+        return Ok(bytes);
+    }
     try_write_tile_to_cache(config, tile_id, &bytes)?;
     Ok(bytes)
 }

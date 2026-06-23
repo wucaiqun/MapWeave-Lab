@@ -19,15 +19,15 @@ impl State {
     pub fn new(window: std::sync::Arc<winit::window::Window>) -> anyhow::Result<Self> {
         let size = window.inner_size();
         let render = RenderState::new(window)?;
+        let camera = CameraState::new(size.width, size.height);
         let mut scene = SceneState::new()?;
 
         scene.prepare(&render.device(), render.surface_format())?;
-        scene.upload(render.device(), render.queue())?;
 
         Ok(Self {
             render,
             scene,
-            camera: CameraState::new(size.width, size.height),
+            camera,
             orbit_drag: false,
             pan_drag: false,
             last_cursor: None,
@@ -117,6 +117,12 @@ impl State {
     }
 
     pub fn render(&mut self) {
+        self.scene.sync_visible_tiles(
+            &self.camera,
+            self.render.device(),
+            self.render.queue(),
+        );
+
         let frame = FrameUniforms {
             view_proj: self.camera.view_proj_cols(),
         };

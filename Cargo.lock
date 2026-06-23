@@ -1321,6 +1321,7 @@ dependencies = [
  "prost-types",
  "protoc-bin-vendored",
  "reqwest",
+ "serde_json",
  "tokio",
 ]
 

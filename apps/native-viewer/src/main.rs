@@ -23,13 +23,12 @@ impl ApplicationHandler for App {
                 .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
 
             let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-            match State::new(window.clone()) {
-                Ok(state) => {
-                    self.window = Some(window);
-                    self.state = Some(state);
-                }
+            self.window = Some(window.clone());
+
+            match State::new(window) {
+                Ok(state) => self.state = Some(state),
                 Err(err) => {
-                    log::error!("failed to initialize state: {err}");
+                    log::error!("failed to initialize renderer: {err}");
                     event_loop.exit();
                 }
             }

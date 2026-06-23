@@ -158,7 +158,7 @@ impl RoadsLayer {
         let mut segments = Vec::new();
 
         for road in roads {
-            let road_points = &road.points_lon_lat;
+            let road_points = &road.points_tile;
             if road_points.len() < 2 {
                 continue;
             }
@@ -493,6 +493,7 @@ impl RenderLayer for RoadsLayer {
 
         if let LayerPayload::Roads(roads) = &layer.payload {
             self.roads = roads.clone();
+            
             self.upload_gpu_data(device, queue)?;
         }
 

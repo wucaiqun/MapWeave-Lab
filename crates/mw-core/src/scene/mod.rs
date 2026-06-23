@@ -15,6 +15,7 @@ pub enum LayerKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LayerPayload {
     Background(Vec<PolygonFeature>),
+    Buildings(Vec<PolygonFeature>),
     Roads(Vec<RoadFeature>),
     Empty,
 }
