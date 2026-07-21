@@ -30,9 +30,9 @@ pub fn decode_mvt_tile(bytes: &[u8]) -> Result<DecodedMvtTile> {
             let geom_type = feature.r#type.and_then(vector_tile::tile::GeomType::from_i32);
             match geom_type {
                 Some(vector_tile::tile::GeomType::Linestring) => {
-                    if let Some(road) = decode_road_feature(&source_layer, layer, feature) {
-                        decoded.roads.push(road);
-                    }
+                    decoded
+                        .roads
+                        .extend(decode_road_features(&source_layer, layer, feature));
                 }
                 Some(vector_tile::tile::GeomType::Polygon) => {
                     if let Some(polygon) = decode_polygon_feature(&source_layer, layer, feature) {
@@ -47,20 +47,31 @@ pub fn decode_mvt_tile(bytes: &[u8]) -> Result<DecodedMvtTile> {
     Ok(decoded)
 }
 
-fn decode_road_feature(
+fn decode_road_features(
     source_layer: &str,
     layer: &vector_tile::tile::Layer,
     feature: &vector_tile::tile::Feature,
-) -> Option<RoadFeature> {
-    let lines = decode_geometry_linestrings(&feature.geometry)?;
-    let points = lines.into_iter().next()?;
-    Some(RoadFeature {
-        id: feature.id.unwrap_or_default(),
-        class: decode_feature_class(layer, feature),
-        source_layer: source_layer.to_string(),
-        points_tile: points,
-    })
+) -> Vec<RoadFeature> {
+    let Some(lines) = decode_geometry_linestrings(&feature.geometry) else {
+        return Vec::new();
+    };
+
+    let id = feature.id.unwrap_or_default();
+    let class = decode_feature_class(layer, feature);
+    lines
+        .into_iter()
+        .filter(|points| points.len() >= 2)
+        .map(|points_tile| RoadFeature {
+            id,
+            class: class.clone(),
+            source_layer: source_layer.to_string(),
+            points_tile,
+        })
+        .collect()
 }
+
+/// Fallback building height when OpenMapTiles omits `render_height` / `height`.
+const DEFAULT_BUILDING_HEIGHT_M: f64 = 10.0;
 
 fn decode_polygon_feature(
     source_layer: &str,
@@ -73,11 +84,22 @@ fn decode_polygon_feature(
         return None;
     }
 
+    let height = decode_numeric_tag(layer, feature, &["render_height", "height"])
+        .or_else(|| {
+            decode_numeric_tag(layer, feature, &["levels", "building:levels"])
+                .map(|levels| levels * 3.0)
+        })
+        .unwrap_or(DEFAULT_BUILDING_HEIGHT_M);
+    let min_height =
+        decode_numeric_tag(layer, feature, &["render_min_height", "min_height"]).unwrap_or(0.0);
+
     Some(PolygonFeature {
         id: feature.id.unwrap_or_default(),
         class: decode_feature_class(layer, feature),
         source_layer: source_layer.to_string(),
         rings,
+        height,
+        min_height,
     })
 }
 
@@ -100,6 +122,52 @@ fn decode_feature_class(layer: &vector_tile::tile::Layer, feature: &vector_tile:
     }
 
     layer.name.clone()
+}
+
+fn decode_numeric_tag(
+    layer: &vector_tile::tile::Layer,
+    feature: &vector_tile::tile::Feature,
+    keys: &[&str],
+) -> Option<f64> {
+    let tags = &feature.tags;
+    let mut i = 0usize;
+    while i + 1 < tags.len() {
+        let key_idx = tags[i] as usize;
+        let val_idx = tags[i + 1] as usize;
+        if let Some(key) = layer.keys.get(key_idx) {
+            if keys.iter().any(|candidate| *candidate == key.as_str()) {
+                if let Some(value) = layer.values.get(val_idx) {
+                    if let Some(number) = value_as_f64(value) {
+                        return Some(number);
+                    }
+                }
+            }
+        }
+        i += 2;
+    }
+    None
+}
+
+fn value_as_f64(value: &vector_tile::tile::Value) -> Option<f64> {
+    if let Some(v) = value.double_value {
+        return Some(v);
+    }
+    if let Some(v) = value.float_value {
+        return Some(f64::from(v));
+    }
+    if let Some(v) = value.int_value {
+        return Some(v as f64);
+    }
+    if let Some(v) = value.uint_value {
+        return Some(v as f64);
+    }
+    if let Some(v) = value.sint_value {
+        return Some(v as f64);
+    }
+    if let Some(text) = &value.string_value {
+        return text.parse().ok();
+    }
+    None
 }
 
 /// Decode MVT geometry into separate rings.

@@ -476,6 +476,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
+name = "earcutr"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "afc28d89ac6cb489f679fcf51aaa62b4667bb0fb73a30f1d4d23949069707c07"
+dependencies = [
+ "itertools",
+ "num-traits",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1304,6 +1314,7 @@ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 name = "mw-core"
 version = "0.1.0"
 dependencies = [
+ "earcutr",
  "serde",
  "thiserror 2.0.18",
 ]
@@ -1340,6 +1351,7 @@ name = "mw-telemetry"
 version = "0.1.0"
 dependencies = [
  "env_logger",
+ "instant",
  "log",
  "wasm-logger",
 ]

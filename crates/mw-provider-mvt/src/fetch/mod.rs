@@ -5,15 +5,28 @@ use std::path::PathBuf;
 
 use crate::MvtProviderConfig;
 
+/// Ensure `endpoint_template` is usable.
+///
+/// Priority:
+/// 1. Use an already-configured template immediately (no network).
+/// 2. Otherwise fetch TileJSON to discover the template.
 pub async fn resolve_endpoint_template(config: &mut MvtProviderConfig) -> Result<()> {
-    let Some(tilejson_url) = config.tilejson_url.clone() else {
-        if config.endpoint_template.is_empty() {
-            return Err(anyhow!("endpoint_template is empty and no tilejson_url was provided"));
-        }
+    if !config.endpoint_template.is_empty() {
         return Ok(());
+    }
+
+    let Some(tilejson_url) = config.tilejson_url.clone() else {
+        return Err(anyhow!(
+            "endpoint_template is empty and no tilejson_url was provided"
+        ));
     };
 
-    let response = reqwest::get(&tilejson_url).await?;
+    config.endpoint_template = fetch_tilejson_template(&tilejson_url).await?;
+    Ok(())
+}
+
+async fn fetch_tilejson_template(tilejson_url: &str) -> Result<String> {
+    let response = reqwest::get(tilejson_url).await?;
     if !response.status().is_success() {
         return Err(anyhow!(
             "failed to fetch TileJSON: {} from {}",
@@ -30,8 +43,7 @@ pub async fn resolve_endpoint_template(config: &mut MvtProviderConfig) -> Result
         .and_then(|tile| tile.as_str())
         .ok_or_else(|| anyhow!("TileJSON at {tilejson_url} has no tiles[] URL template"))?;
 
-    config.endpoint_template = template.to_string();
-    Ok(())
+    Ok(template.to_string())
 }
 
 pub fn build_tile_url(config: &MvtProviderConfig, tile_id: TileId) -> String {
@@ -96,6 +108,7 @@ fn try_write_tile_to_cache(config: &MvtProviderConfig, tile_id: TileId, bytes: &
 }
 
 pub async fn fetch_tile_bytes(config: &MvtProviderConfig, tile_id: TileId) -> Result<Vec<u8>> {
+    // Local cache always wins over the network.
     if let Some(bytes) = try_read_tile_from_cache(config, tile_id)? {
         return Ok(bytes);
     }

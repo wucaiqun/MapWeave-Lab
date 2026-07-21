@@ -1,7 +1,13 @@
-use mw_core::{LayerKind, LayerPayload, RoadFeature, TileId, TileLayerData, TileSceneData};
+use mw_core::{
+    meters_to_world, LayerKind, LayerPayload, RoadFeature, TileId, TileLayerData, TileSceneData,
+    WORLD_ZOOM,
+};
 
 use crate::config::MvtSourceProfile;
 use crate::decode::DecodedMvtTile;
+
+/// Ensure buildings without/near-zero height still extrude enough to read as volumes.
+const MIN_BUILDING_EXTRUDE_M: f64 = 3.0;
 
 /// OpenMapTiles polygon layers used as map background fills.
 const OPENMAPTILES_FILL_LAYERS: &[&str] = &["water", "landcover", "landuse", "park"];
@@ -33,10 +39,20 @@ pub fn map_decoded_tile_to_scene(
 
     let mut background = Vec::new();
     let mut buildings = Vec::new();
-    for polygon in decoded.polygons {
+    for mut polygon in decoded.polygons {
         if building_layers.contains(&polygon.source_layer.as_str()) {
+            let top_m = polygon
+                .height
+                .max(polygon.min_height + MIN_BUILDING_EXTRUDE_M);
+            let bottom_m = polygon.min_height.max(0.0);
+            // Heights live in WORLD_ZOOM units so merge can scale footprints without
+            // double-scaling extrusion.
+            polygon.height = meters_to_world(top_m, WORLD_ZOOM);
+            polygon.min_height = meters_to_world(bottom_m, WORLD_ZOOM);
             buildings.push(polygon);
         } else if fill_layers.contains(&polygon.source_layer.as_str()) {
+            polygon.height = 0.0;
+            polygon.min_height = 0.0;
             background.push(polygon);
         }
     }

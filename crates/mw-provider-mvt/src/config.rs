@@ -20,9 +20,14 @@ pub struct MvtProviderConfig {
 
 impl MvtProviderConfig {
     /// OpenStreetMap vector tiles via OpenFreeMap (no API key, zoom 0–14).
+    ///
+    /// Uses a stable ZXY template so tiles can load from `cache_dir` without a
+    /// network TileJSON round-trip. TileJSON remains available as an optional refresh.
     pub fn openfreemap() -> Self {
         Self {
-            endpoint_template: String::new(),
+            // OpenFreeMap accepts any version segment and serves latest tiles.
+            endpoint_template: "https://tiles.openfreemap.org/planet/latest/{z}/{x}/{y}.pbf"
+                .to_string(),
             tilejson_url: Some("https://tiles.openfreemap.org/planet".to_string()),
             source_profile: MvtSourceProfile::OpenMapTiles,
             access_token: String::new(),

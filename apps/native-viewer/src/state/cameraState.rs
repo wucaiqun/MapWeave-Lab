@@ -1,23 +1,29 @@
 use mw_core::{
-    lng_lat_to_world_center, tiles_in_world_rect, TileId, WorldRect, DEFAULT_ZOOM, TILE_EXTENT,
-    VALENCIA,
+    lng_lat_to_world_center, tile_zoom_for_ground_width, tiles_in_world_rect, world_units_per_tile,
+    TileId, WorldRect, DEFAULT_ZOOM, VALENCIA, WORLD_ZOOM,
 };
 
 /// Extra margin beyond the screen footprint (fraction of visible ground width).
 const SCREEN_MARGIN_FRACTION: f64 = 0.12;
 
 /// 3D orbit camera over the map plane (world XZ, Y up).
+///
+/// Target is stored in `f64` world units at [`WORLD_ZOOM`]. Rendering uses a
+/// camera-relative `view_proj` so GPU `f32` math stays near the origin.
+///
+/// Tile fetch zoom (`zoom`) follows view width via [`tile_zoom_for_ground_width`].
 #[derive(Debug, Clone)]
 pub struct CameraState {
-    /// Look-at point on the map plane (world X, 0, world Z).
-    target: glam::Vec3,
+    /// Look-at point on the map plane (world X, world Z) in f64.
+    target_x: f64,
+    target_z: f64,
     /// Azimuth around world Y (radians).
     yaw: f32,
     /// Elevation above the horizon (radians, clamped).
     pitch: f32,
     /// Distance from target to eye.
     distance: f32,
-    /// Slippy-map zoom level used for tile selection.
+    /// Slippy-map zoom level used for tile selection (LOD).
     zoom: u8,
     fov_y: f32,
     near: f32,
@@ -28,69 +34,107 @@ pub struct CameraState {
 
 impl CameraState {
     pub fn new(viewport_width: u32, viewport_height: u32) -> Self {
-        let [cx, cz] = lng_lat_to_world_center(VALENCIA.lng, VALENCIA.lat, DEFAULT_ZOOM);
-        Self {
-            target: glam::Vec3::new(cx as f32, 0.0, cz as f32),
+        let [cx, cz] = lng_lat_to_world_center(VALENCIA.lng, VALENCIA.lat, WORLD_ZOOM);
+        let mut cam = Self {
+            target_x: cx,
+            target_z: cz,
             yaw: 0.7,
             pitch: 0.65,
             distance: 9_000.0,
             zoom: DEFAULT_ZOOM,
             fov_y: 45.0_f32.to_radians(),
             near: 1.0,
-            far: 50_000.0,
+            far: 80_000.0,
             viewport_width: viewport_width.max(1) as f32,
             viewport_height: viewport_height.max(1) as f32,
-        }
+        };
+        cam.refresh_tile_zoom();
+        cam
     }
 
     pub fn resize(&mut self, viewport_width: u32, viewport_height: u32) {
         self.viewport_width = viewport_width.max(1) as f32;
         self.viewport_height = viewport_height.max(1) as f32;
+        self.refresh_tile_zoom();
     }
 
     pub fn reset(&mut self) {
         *self = Self::new(self.viewport_width as u32, self.viewport_height as u32);
     }
 
-    pub fn eye_position(&self) -> glam::Vec3 {
+    /// World-space look-at on the ground plane (Y = 0).
+    pub fn target_world(&self) -> [f64; 2] {
+        [self.target_x, self.target_z]
+    }
+
+    /// Eye position relative to the look-at target (camera-local space).
+    fn eye_offset(&self) -> glam::Vec3 {
         let cos_pitch = self.pitch.cos();
         let sin_pitch = self.pitch.sin();
         let sin_yaw = self.yaw.sin();
         let cos_yaw = self.yaw.cos();
 
-        let offset = glam::Vec3::new(
+        glam::Vec3::new(
             cos_pitch * sin_yaw,
             sin_pitch,
             cos_pitch * cos_yaw,
+        ) * self.distance
+    }
+
+    /// View-projection for geometry uploaded as `world - mesh_origin`.
+    ///
+    /// When `mesh_origin == target`, look-at is at the relative origin.
+    /// A small pan residual is absorbed here so we need not re-upload every frame.
+    pub fn view_proj_relative_to(&self, mesh_origin: [f64; 2]) -> glam::Mat4 {
+        let residual = glam::Vec3::new(
+            (self.target_x - mesh_origin[0]) as f32,
+            0.0,
+            (self.target_z - mesh_origin[1]) as f32,
         );
-
-        self.target + offset * self.distance
-    }
-
-    pub fn view(&self) -> glam::Mat4 {
-        glam::Mat4::look_at_rh(self.eye_position(), self.target, glam::Vec3::Y)
-    }
-
-    pub fn projection(&self) -> glam::Mat4 {
+        let eye = residual + self.eye_offset();
+        let view = glam::Mat4::look_at_rh(eye, residual, glam::Vec3::Y);
         let aspect = self.viewport_width / self.viewport_height;
-        glam::Mat4::perspective_rh(self.fov_y, aspect, self.near, self.far)
+        let proj = glam::Mat4::perspective_rh(self.fov_y, aspect, self.near, self.far);
+        proj * view
     }
 
-    pub fn view_proj(&self) -> glam::Mat4 {
-        self.projection() * self.view()
+    pub fn view_proj_cols_for(&self, mesh_origin: [f64; 2]) -> [[f32; 4]; 4] {
+        self.view_proj_relative_to(mesh_origin).to_cols_array_2d()
     }
 
-    pub fn view_proj_cols(&self) -> [[f32; 4]; 4] {
-        self.view_proj().to_cols_array_2d()
+    pub fn zoom(&self) -> u8 {
+        self.zoom
     }
 
-    pub fn target(&self) -> glam::Vec3 {
-        self.target
+    pub fn distance(&self) -> f32 {
+        self.distance
     }
 
-    /// Unproject a screen pixel to the Y=0 ground plane.
-    pub fn unproject_to_ground(&self, screen_x: f32, screen_y: f32) -> Option<glam::Vec3> {
-        let inv = self.view_proj().inverse();
+    pub fn yaw(&self) -> f32 {
+        self.yaw
+    }
+
+    pub fn pitch(&self) -> f32 {
+        self.pitch
+    }
+
+    /// Update tile LOD from the current ground footprint width.
+    pub fn refresh_tile_zoom(&mut self) {
+        let width = self.ground_width();
+        self.zoom = tile_zoom_for_ground_width(width, self.zoom);
+    }
+
+    /// Approximate visible ground width (screen bbox, with FOV fallback).
+    fn ground_width(&self) -> f64 {
+        let bbox = self.ground_bbox();
+        bbox.width().max(self.max_ground_half_extent() * 2.0)
+    }
+
+    /// Unproject a screen pixel to the Y=0 ground plane in camera-relative space,
+    /// then convert back to world XZ.
+    pub fn unproject_to_ground_world(&self, screen_x: f32, screen_y: f32) -> Option<[f64; 2]> {
+        let origin = self.target_world();
+        let inv = self.view_proj_relative_to(origin).inverse();
         let ndc_x = (screen_x / self.viewport_width) * 2.0 - 1.0;
         let ndc_y = 1.0 - (screen_y / self.viewport_height) * 2.0;
 
@@ -113,7 +157,11 @@ impl CameraState {
             return None;
         }
 
-        Some(near + dir * t)
+        let local = near + dir * t;
+        Some([
+            origin[0] + f64::from(local.x),
+            origin[1] + f64::from(local.z),
+        ])
     }
 
     /// Ground-plane footprint of the viewport via screen-corner unprojection.
@@ -127,7 +175,7 @@ impl CameraState {
 
         let mut points = Vec::with_capacity(corners.len());
         for (sx, sy) in corners {
-            if let Some(p) = self.unproject_to_ground(sx, sy) {
+            if let Some(p) = self.unproject_to_ground_world(sx, sy) {
                 points.push(self.clamp_to_screen_ground_extent(p));
             }
         }
@@ -139,9 +187,23 @@ impl CameraState {
         self.expand_screen_margin(self.fallback_ground_rect())
     }
 
-    /// Tiles intersecting the screen footprint (+ small margin), derived from viewport size.
+    /// Tiles intersecting the screen footprint (+ small margin), at current LOD zoom.
     pub fn visible_tiles(&self) -> Vec<TileId> {
-        tiles_in_world_rect(self.ground_bbox(), self.zoom)
+        let span = world_units_per_tile(self.zoom);
+        let tiles = tiles_in_world_rect(self.ground_bbox(), self.zoom);
+        if !tiles.is_empty() {
+            return tiles;
+        }
+
+        // Degenerate unprojection (horizon / NaN): fall back to the tile under the target.
+        let tx = (self.target_x / span).floor().max(0.0) as u32;
+        let ty = (self.target_z / span).floor().max(0.0) as u32;
+        let max_index = (1u32 << self.zoom).saturating_sub(1);
+        vec![TileId::new(
+            self.zoom,
+            tx.min(max_index),
+            ty.min(max_index),
+        )]
     }
 
     /// Horizontal half-extent of visible ground from viewport FOV, aspect, distance, and pitch.
@@ -154,19 +216,16 @@ impl CameraState {
     }
 
     /// Keep corner rays inside the screen-derived ground range (steep pitch can hit very far away).
-    fn clamp_to_screen_ground_extent(&self, p: glam::Vec3) -> [f64; 2] {
+    fn clamp_to_screen_ground_extent(&self, p: [f64; 2]) -> [f64; 2] {
         let max_half = self.max_ground_half_extent();
-        let dx = f64::from(p.x - self.target.x);
-        let dz = f64::from(p.z - self.target.z);
+        let dx = p[0] - self.target_x;
+        let dz = p[1] - self.target_z;
         let dist = (dx * dx + dz * dz).sqrt();
         if dist > max_half && dist > f64::EPSILON {
             let scale = max_half / dist;
-            [
-                f64::from(self.target.x) + dx * scale,
-                f64::from(self.target.z) + dz * scale,
-            ]
+            [self.target_x + dx * scale, self.target_z + dz * scale]
         } else {
-            [f64::from(p.x), f64::from(p.z)]
+            p
         }
     }
 
@@ -174,53 +233,53 @@ impl CameraState {
         let width = rect.x_max - rect.x_min;
         let height = rect.z_max - rect.z_min;
         let margin = width.max(height) * SCREEN_MARGIN_FRACTION;
-        rect.expand(margin.max(TILE_EXTENT * 0.25))
+        let min_margin = world_units_per_tile(self.zoom) * 0.25;
+        rect.expand(margin.max(min_margin))
     }
 
     fn fallback_ground_rect(&self) -> WorldRect {
         let half = self.max_ground_half_extent();
-        let cx = f64::from(self.target.x);
-        let cz = f64::from(self.target.z);
         WorldRect {
-            x_min: cx - half,
-            x_max: cx + half,
-            z_min: cz - half,
-            z_max: cz + half,
+            x_min: self.target_x - half,
+            x_max: self.target_x + half,
+            z_min: self.target_z - half,
+            z_max: self.target_z + half,
         }
     }
 
-    /// Left-drag: orbit around the target.
+    /// Right-drag: orbit around the target.
     pub fn orbit_screen_pixels(&mut self, dx: f32, dy: f32) {
         const ORBIT_SENSITIVITY: f32 = 0.005;
-        self.yaw -= dx * ORBIT_SENSITIVITY;
-        self.pitch = (self.pitch - dy * ORBIT_SENSITIVITY).clamp(0.12, 1.45);
+        self.yaw += dx * ORBIT_SENSITIVITY;
+        self.pitch = (self.pitch + dy * ORBIT_SENSITIVITY).clamp(0.12, 1.45);
+        self.refresh_tile_zoom();
     }
 
-    /// Right-drag / middle-drag: pan target on the map plane.
+    /// Left-drag: pan on the ground plane so the map follows the cursor (grab-to-scroll).
     pub fn pan_screen_pixels(&mut self, dx: f32, dy: f32) {
-        let eye = self.eye_position();
-        let forward = (self.target - eye).normalize();
-        let mut right = forward.cross(glam::Vec3::Y);
-        if right.length_squared() < f32::EPSILON {
-            right = glam::Vec3::X;
-        } else {
-            right = right.normalize();
+        if dx == 0.0 && dy == 0.0 {
+            return;
         }
 
-        let mut forward_ground = glam::Vec3::new(-forward.x, 0.0, -forward.z);
-        if forward_ground.length_squared() < f32::EPSILON {
-            forward_ground = glam::Vec3::NEG_Z;
-        } else {
-            forward_ground = forward_ground.normalize();
-        }
+        // Compare ground under screen-center vs center+(dx,dy); moving the target by
+        // (from - to) keeps the grabbed point glued to the cursor on both axes.
+        let cx = self.viewport_width * 0.5;
+        let cy = self.viewport_height * 0.5;
+        let Some(from) = self.unproject_to_ground_world(cx, cy) else {
+            return;
+        };
+        let Some(to) = self.unproject_to_ground_world(cx + dx, cy + dy) else {
+            return;
+        };
 
-        let scale = self.distance * 0.0012;
-        self.target += right * (-dx * scale) + forward_ground * (dy * scale);
+        self.target_x += from[0] - to[0];
+        self.target_z += from[1] - to[1];
     }
 
     pub fn zoom_by_factor(&mut self, factor: f32) {
         const MIN_DISTANCE: f32 = 400.0;
-        const MAX_DISTANCE: f32 = 30_000.0;
+        const MAX_DISTANCE: f32 = 80_000.0;
         self.distance = (self.distance * factor).clamp(MIN_DISTANCE, MAX_DISTANCE);
+        self.refresh_tile_zoom();
     }
 }

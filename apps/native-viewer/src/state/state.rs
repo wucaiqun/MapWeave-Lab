@@ -1,5 +1,6 @@
 use super::{CameraState, RenderState, SceneState};
 use mw_render_wgpu::FrameUniforms;
+use mw_telemetry::FramePerfMonitor;
 use winit::{
     dpi::PhysicalPosition,
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
@@ -10,9 +11,11 @@ pub struct State {
     pub render: RenderState,
     pub scene: SceneState,
     pub camera: CameraState,
+    perf: FramePerfMonitor,
     orbit_drag: bool,
     pan_drag: bool,
     last_cursor: Option<PhysicalPosition<f64>>,
+    last_triangle_count: u32,
 }
 
 impl State {
@@ -28,9 +31,11 @@ impl State {
             render,
             scene,
             camera,
+            perf: FramePerfMonitor::new(),
             orbit_drag: false,
             pan_drag: false,
             last_cursor: None,
+            last_triangle_count: 0,
         })
     }
 
@@ -44,14 +49,16 @@ impl State {
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = *state == ElementState::Pressed;
                 match button {
+                    // Left-drag: pan — map scrolls the way you drag.
                     MouseButton::Left => {
-                        self.orbit_drag = pressed;
+                        self.pan_drag = pressed;
                         if !pressed {
                             self.last_cursor = None;
                         }
                     }
-                    MouseButton::Right | MouseButton::Middle => {
-                        self.pan_drag = pressed;
+                    // Right-drag: orbit around the look-at target.
+                    MouseButton::Right => {
+                        self.orbit_drag = pressed;
                         if !pressed {
                             self.last_cursor = None;
                         }
@@ -117,16 +124,52 @@ impl State {
     }
 
     pub fn render(&mut self) {
-        self.scene.sync_visible_tiles(
-            &self.camera,
+        self.perf.begin_frame();
+
+        let sync = self.scene.sync_visible_tiles(
+            &mut self.camera,
             self.render.device(),
             self.render.queue(),
         );
 
+        let mesh_origin = self
+            .scene
+            .mesh_origin()
+            .unwrap_or_else(|| self.camera.target_world());
         let frame = FrameUniforms {
-            view_proj: self.camera.view_proj_cols(),
+            view_proj: self.camera.view_proj_cols_for(mesh_origin),
         };
-        self.render
+
+        let (render_ms, render_stats) = self.render
             .render(&self.scene.renderer, self.scene.clear_color(), &frame);
+
+        if render_stats.triangles < self.last_triangle_count {
+            log::warn!(
+                "render: triangle drop {} → {} (draw_calls={}) while orbit={} pan={}",
+                self.last_triangle_count,
+                render_stats.triangles,
+                render_stats.draw_calls,
+                self.orbit_drag,
+                self.pan_drag,
+            );
+        } else if render_stats.triangles != self.last_triangle_count {
+            log::info!(
+                "render: triangles {} → {} (draw_calls={})",
+                self.last_triangle_count,
+                render_stats.triangles,
+                render_stats.draw_calls,
+            );
+        }
+        self.last_triangle_count = render_stats.triangles;
+
+        self.perf.end_frame(
+            sync.tile_fetch_ms,
+            sync.merge_ms,
+            sync.upload_ms,
+            sync.tiles_fetched,
+            render_ms,
+            render_stats.draw_calls,
+            render_stats.triangles,
+        );
     }
 }

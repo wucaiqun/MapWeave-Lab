@@ -1,6 +1,6 @@
 use mw_core::TileLayerData;
 
-use crate::FrameUniforms;
+use crate::{FrameUniforms, RenderStats};
 
 pub trait RenderLayer {
     fn prepare(&mut self, device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> anyhow::Result<()>;
@@ -17,5 +17,5 @@ pub trait RenderLayer {
         pass: &mut wgpu::RenderPass<'_>,
         queue: &wgpu::Queue,
         frame: &FrameUniforms,
-    );
+    ) -> RenderStats;
 }

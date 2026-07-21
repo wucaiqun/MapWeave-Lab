@@ -1,7 +1,7 @@
 use std::mem;
 
 use bytemuck::{Pod, Zeroable};
-use mw_core::{triangulate_polygon_features, LayerKind, LayerPayload, TileLayerData};
+use mw_core::{triangulate_polygon_features, LayerKind, LayerPayload, PolygonFeature, TileLayerData};
 
 use crate::{FrameUniforms, RenderLayer, RenderStats, DEPTH_FORMAT};
 
@@ -15,37 +15,42 @@ struct Uniforms {
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
+    @location(0) shade: f32,
 }
 
 @vertex
-fn vs_main(@location(0) pos: vec2<f32>) -> VertexOutput {
+fn vs_main(
+    @location(0) pos: vec3<f32>,
+    @location(1) shade: f32,
+) -> VertexOutput {
     var out: VertexOutput;
-    // MVT tile (x, y) -> world (x, 0, z) on the ground plane, Y up.
-    out.position = uniforms.view_proj * vec4<f32>(pos.x, 0.0, pos.y, 1.0);
+    out.position = uniforms.view_proj * vec4<f32>(pos, 1.0);
+    out.shade = shade;
     return out;
 }
 
 @fragment
-fn fs_main() -> @location(0) vec4<f32> {
-    return uniforms.color;
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(uniforms.color.rgb * in.shade, uniforms.color.a);
 }
 "#;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct BackgroundUniforms {
+struct BuildingsUniforms {
     view_proj: [[f32; 4]; 4],
     color: [f32; 4],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct BackgroundVertex {
-    position: [f32; 2],
+struct BuildingsVertex {
+    position: [f32; 3],
+    shade: f32,
 }
 
-pub struct BackgroundLayer {
-    pub background: Vec<mw_core::PolygonFeature>,
+pub struct BuildingsLayer {
+    pub buildings: Vec<mw_core::PolygonFeature>,
     pipeline: Option<wgpu::RenderPipeline>,
     bind_group_layout: Option<wgpu::BindGroupLayout>,
     bind_group: Option<wgpu::BindGroup>,
@@ -56,10 +61,10 @@ pub struct BackgroundLayer {
     fill_color: [f32; 4],
 }
 
-impl Default for BackgroundLayer {
+impl Default for BuildingsLayer {
     fn default() -> Self {
         Self {
-            background: Vec::new(),
+            buildings: Vec::new(),
             pipeline: None,
             bind_group_layout: None,
             bind_group: None,
@@ -67,27 +72,35 @@ impl Default for BackgroundLayer {
             vertex_buffer: None,
             index_buffer: None,
             index_count: 0,
-            fill_color: [0.08, 0.12, 0.18, 1.0],
+            fill_color: [0.78, 0.74, 0.68, 1.0],
         }
     }
 }
 
-impl BackgroundLayer {
-    fn build_mesh(polygons: &[mw_core::PolygonFeature]) -> (Vec<BackgroundVertex>, Vec<u32>) {
-        let mesh = triangulate_polygon_features(polygons);
-        let vertices = mesh
-            .positions
-            .into_iter()
-            .map(|position| BackgroundVertex { position })
-            .collect();
-        (vertices, mesh.indices)
+impl BuildingsLayer {
+    fn build_mesh(polygons: &[PolygonFeature]) -> (Vec<BuildingsVertex>, Vec<u32>) {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+
+        for polygon in polygons {
+            // Heights are already world-Y after `map_decoded_tile_to_scene`.
+            let top = polygon.height.max(polygon.min_height) as f32;
+            let bottom = polygon.min_height as f32;
+
+            push_roof(&mut vertices, &mut indices, polygon, top);
+            for ring in &polygon.rings {
+                push_wall_ring(&mut vertices, &mut indices, &ring.points, bottom, top);
+            }
+        }
+
+        (vertices, indices)
     }
 
     fn upload_mesh(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        vertices: &[BackgroundVertex],
+        vertices: &[BuildingsVertex],
         indices: &[u32],
     ) {
         self.index_count = indices.len() as u32;
@@ -99,8 +112,8 @@ impl BackgroundLayer {
         }
 
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("background-vertex-buffer"),
-            size: (vertices.len() * mem::size_of::<BackgroundVertex>()) as u64,
+            label: Some("buildings-vertex-buffer"),
+            size: (vertices.len() * mem::size_of::<BuildingsVertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -108,7 +121,7 @@ impl BackgroundLayer {
         self.vertex_buffer = Some(vertex_buffer);
 
         let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("background-index-buffer"),
+            label: Some("buildings-index-buffer"),
             size: (indices.len() * mem::size_of::<u32>()) as u64,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -118,15 +131,81 @@ impl BackgroundLayer {
     }
 }
 
-impl RenderLayer for BackgroundLayer {
+fn push_roof(
+    vertices: &mut Vec<BuildingsVertex>,
+    indices: &mut Vec<u32>,
+    polygon: &PolygonFeature,
+    top: f32,
+) {
+    let mesh = triangulate_polygon_features(std::slice::from_ref(polygon));
+    if mesh.indices.is_empty() {
+        return;
+    }
+
+    let base = vertices.len() as u32;
+    for position in mesh.positions {
+        vertices.push(BuildingsVertex {
+            position: [position[0], top, position[1]],
+            shade: 1.0,
+        });
+    }
+    indices.extend(mesh.indices.into_iter().map(|i| i + base));
+}
+
+fn push_wall_ring(
+    vertices: &mut Vec<BuildingsVertex>,
+    indices: &mut Vec<u32>,
+    points: &[[f64; 2]],
+    bottom: f32,
+    top: f32,
+) {
+    if points.len() < 2 || top <= bottom {
+        return;
+    }
+
+    let count = points.len();
+    for i in 0..count {
+        let a = points[i];
+        let b = points[(i + 1) % count];
+        let ax = a[0] as f32;
+        let az = a[1] as f32;
+        let bx = b[0] as f32;
+        let bz = b[1] as f32;
+
+        let base = vertices.len() as u32;
+        // Slightly darker walls so volume reads without a lighting system.
+        let shade = 0.72;
+        vertices.extend_from_slice(&[
+            BuildingsVertex {
+                position: [ax, bottom, az],
+                shade,
+            },
+            BuildingsVertex {
+                position: [bx, bottom, bz],
+                shade,
+            },
+            BuildingsVertex {
+                position: [bx, top, bz],
+                shade,
+            },
+            BuildingsVertex {
+                position: [ax, top, az],
+                shade,
+            },
+        ]);
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+}
+
+impl RenderLayer for BuildingsLayer {
     fn prepare(&mut self, device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> anyhow::Result<()> {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("background-shader"),
+            label: Some("buildings-shader"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("background-bind-group-layout"),
+            label: Some("buildings-bind-group-layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
@@ -140,25 +219,32 @@ impl RenderLayer for BackgroundLayer {
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("background-pipeline-layout"),
+            label: Some("buildings-pipeline-layout"),
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("background-pipeline"),
+            label: Some("buildings-pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: mem::size_of::<BackgroundVertex>() as u64,
+                    array_stride: mem::size_of::<BuildingsVertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x2,
-                        offset: 0,
-                        shader_location: 0,
-                    }],
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32,
+                            offset: 12,
+                            shader_location: 1,
+                        },
+                    ],
                 }],
                 compilation_options: Default::default(),
             },
@@ -194,14 +280,14 @@ impl RenderLayer for BackgroundLayer {
         });
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("background-uniform-buffer"),
-            size: mem::size_of::<BackgroundUniforms>() as u64,
+            label: Some("buildings-uniform-buffer"),
+            size: mem::size_of::<BuildingsUniforms>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("background-bind-group"),
+            label: Some("buildings-bind-group"),
             layout: &bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
@@ -223,13 +309,13 @@ impl RenderLayer for BackgroundLayer {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> anyhow::Result<()> {
-        if layer.kind != LayerKind::Background {
+        if layer.kind != LayerKind::Buildings {
             return Ok(());
         }
 
-        if let LayerPayload::Background(background) = &layer.payload {
-            self.background = background.clone();
-            let (vertices, indices) = Self::build_mesh(&self.background);
+        if let LayerPayload::Buildings(buildings) = &layer.payload {
+            self.buildings = buildings.clone();
+            let (vertices, indices) = Self::build_mesh(&self.buildings);
             self.upload_mesh(device, queue, &vertices, &indices);
         }
 
@@ -257,7 +343,7 @@ impl RenderLayer for BackgroundLayer {
             return RenderStats::default();
         }
 
-        let uniforms: BackgroundUniforms = BackgroundUniforms {
+        let uniforms = BuildingsUniforms {
             view_proj: frame.view_proj,
             color: self.fill_color,
         };

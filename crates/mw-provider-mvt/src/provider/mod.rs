@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 use mw_core::{TileId, TileSceneData};
+use mw_telemetry::{elapsed_ms, print_perf_if};
+use std::time::Instant;
 
 use crate::MvtProviderConfig;
 use crate::decode::{decode_mvt_tile, DecodedMvtTile};
@@ -37,13 +39,34 @@ impl MvtProvider {
 #[async_trait]
 impl TileProvider for MvtProvider {
     async fn fetch_tile(&self, tile_id: TileId) -> anyhow::Result<TileSceneData> {
+        let fetch_start = Instant::now();
         let bytes = fetch_tile_bytes(&self.config, tile_id).await?;
+        let fetch_ms = elapsed_ms(fetch_start);
+
+        let decode_start = Instant::now();
         let decoded = if bytes.is_empty() {
             DecodedMvtTile::default()
         } else {
             decode_mvt_tile(&bytes)?
         };
+        let decode_ms = elapsed_ms(decode_start);
+
+        let map_start = Instant::now();
         let scene = map_decoded_tile_to_scene(tile_id, decoded, self.config.source_profile);
+        let map_ms = elapsed_ms(map_start);
+        let total_ms = fetch_ms + decode_ms + map_ms;
+
+        print_perf_if(
+            total_ms,
+            format!(
+                "tile z={} x={} y={}: fetch={fetch_ms:.2}ms decode={decode_ms:.2}ms map={map_ms:.2}ms ({} bytes)",
+                tile_id.z,
+                tile_id.x,
+                tile_id.y,
+                bytes.len(),
+            ),
+        );
+
         Ok(scene)
     }
 }

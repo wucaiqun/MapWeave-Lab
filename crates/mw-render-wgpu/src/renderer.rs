@@ -1,6 +1,9 @@
 use mw_core::TileSceneData;
 
-use crate::{FrameUniforms, RenderLayer};
+use crate::{FrameUniforms, RenderLayer, RenderStats};
+
+/// Shared depth buffer format for all opaque/map layers.
+pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 pub struct RendererConfig {
     pub clear_color: wgpu::Color,
@@ -45,10 +48,17 @@ impl Renderer {
         Ok(())
     }
 
-    pub fn render(&self, pass: &mut wgpu::RenderPass<'_>, queue: &wgpu::Queue, frame: &FrameUniforms) {
+    pub fn render(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        queue: &wgpu::Queue,
+        frame: &FrameUniforms,
+    ) -> RenderStats {
+        let mut stats = RenderStats::default();
         for layer in &self.layers {
-            layer.render(pass, queue, frame);
+            stats.merge(layer.render(pass, queue, frame));
         }
+        stats
     }
 
     pub fn clear_color(&self) -> wgpu::Color {

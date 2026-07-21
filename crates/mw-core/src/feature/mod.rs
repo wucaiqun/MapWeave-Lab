@@ -27,4 +27,8 @@ pub struct PolygonFeature {
     pub class: String,
     pub source_layer: String,
     pub rings: Vec<PolygonRing>,
+    /// Building extrusion top. Meters from MVT decode; world Y after tile mapping.
+    pub height: f64,
+    /// Building extrusion bottom. Meters from MVT decode; world Y after tile mapping.
+    pub min_height: f64,
 }
