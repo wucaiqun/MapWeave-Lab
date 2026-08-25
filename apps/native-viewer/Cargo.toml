@@ -7,8 +7,8 @@ edition = "2024"
 anyhow.workspace = true
 glam.workspace = true
 pollster = "0.4"
-tokio = { version = "1", features = ["rt-multi-thread"] }
 mw-core = { path = "../../crates/mw-core" }
+mw-async-data = { path = "../../crates/mw-async-data" }
 mw-provider-mvt = { path = "../../crates/mw-provider-mvt" }
 mw-render-wgpu = { path = "../../crates/mw-render-wgpu" }
 mw-telemetry = { path = "../../crates/mw-telemetry" }

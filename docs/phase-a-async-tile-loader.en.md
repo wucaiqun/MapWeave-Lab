@@ -1,314 +1,298 @@
-# Phase A: Async Tile Loader Design
+# Phase A: Async Data Task Framework (Tokio)
 
 > Status: design only (not implemented yet)  
-> Scope: move tile downloading off the winit render thread  
+> Core idea: **tokio is the shared async framework for all data work**, not a one-off tile downloader  
+> First concrete job type: **MVT tile fetch**  
 > Related code: `apps/native-viewer/src/state/sceneState.rs`, `crates/mw-provider-mvt`
 
----
-
-## 1. Problem
-
-Every frame, `State::render()` calls `SceneState::sync_visible_tiles()`, which loads missing tiles with:
-
-```text
-tokio::Runtime::block_on(provider.fetch_tile(tile_id))
-```
-
-This runs on the **winit main thread**. Slow HTTP/decode causes:
-
-- hitches and dropped frames
-- sluggish camera pan/orbit
-- “blocked frames” in the perf monitor
-
-`mw-provider-mvt` is already async. The bug is the **call site**: synchronous `block_on` on the UI thread.
+Chinese version: [`phase-a-async-tile-loader.zh.md`](./phase-a-async-tile-loader.zh.md)
 
 ---
 
-## 2. Goals
+## 1. What we mean (important)
+
+“Background tokio tasks” is **not** the whole design.
+
+The design is:
+
+> Build a **general async data-task framework** on tokio.  
+> Every kind of expensive/off-main-thread data work becomes a **job type**.  
+> Phase A only implements the first job type: **tile download + decode**.
+
+So:
+
+| Layer | Role |
+|-------|------|
+| **Framework** | runtime, queue, spawn, priority, cancel, result drain |
+| **Job types** | TileFetch today; later MeshBuild, StyleResolve, GlyphLoad, … |
+| **Main thread** | decide what is needed, drain results, upload GPU, draw |
+
+Tiles are the first customer of the framework — not the framework itself.
+
+---
+
+## 2. Problem today
+
+`SceneState` owns a tokio runtime and calls `block_on(fetch_tile)` on the **winit main thread**.
+
+That couples:
+
+- UI frame loop
+- network I/O
+- decode
+- cache / sticky / merge
+- GPU upload
+
+into one path. Adding another async data source later (glyphs, DEM, style JSON, heavy mesh jobs) would repeat the same mistake.
+
+---
+
+## 3. Goals
 
 | Goal | Meaning |
 |------|---------|
-| Non-blocking UI | No network `block_on` inside `RedrawRequested` |
-| Background download | HTTP + MVT decode on a dedicated async runtime |
-| Non-blocking handoff | Main thread only submits requests and drains results |
-| Preserve behavior | Keep sticky visibility, same-zoom cache, per-frame throttling |
+| Shared async substrate | One tokio runtime + task API for all async data jobs |
+| Job-typed work | Each data kind is a typed job, not ad-hoc `spawn` scattered in app code |
+| Non-blocking UI | Main thread never `block_on`s network/decode |
+| Extensible | New data types plug in without redesigning threading |
+| Phase A deliverable | Ship **TileFetch** on top of that framework first |
 
-Non-goals for this phase:
+Non-goals for Phase A:
 
 - config module (Phase B)
-- render/style abstraction (Phase C)
-- PBR / materials
+- full style/render split (Phase C)
+- PBR
+- implementing every future job type now
 
 ---
 
-## 3. Architecture diagrams
+## 4. Architecture
 
-### 3.1 Current (blocking)
+### 4.1 Framework vs job types
 
 ```mermaid
-sequenceDiagram
-    participant UI as winit main thread
-    participant Scene as SceneState
-    participant RT as tokio Runtime<br/>(same process, block_on)
-    participant Net as HTTP / disk cache
-
-    UI->>Scene: sync_visible_tiles()
-    loop each missing tile (max 9)
-        Scene->>RT: block_on(fetch_tile)
-        RT->>Net: GET .pbf
-        Net-->>RT: bytes
-        RT-->>Scene: TileSceneData
+flowchart TB
+    subgraph Main["Main thread (winit)"]
+        App[State / SceneState]
+        Drain[drain_results]
+        GPU[wgpu upload + draw]
     end
-    Scene->>Scene: merge + GPU upload
-    Scene-->>UI: return (may stall tens~hundreds of ms)
+
+    subgraph Framework["mw-async-data / DataTaskRuntime"]
+        RT[tokio multi-thread runtime]
+        Inbox[Job inbox]
+        Sched[Scheduler<br/>priority + concurrency caps]
+        Outbox[Result outbox]
+    end
+
+    subgraph Jobs["Job types (plugins)"]
+        J1[TileFetch]
+        J2[MeshBuild later]
+        J3[StyleResolve later]
+        J4[AssetLoad later]
+    end
+
+    App -->|submit Job| Inbox
+    Inbox --> Sched
+    Sched --> RT
+    RT --> J1
+    RT -.-> J2
+    RT -.-> J3
+    RT -.-> J4
+    J1 --> Outbox
+    J2 -.-> Outbox
+    Outbox -->|try_recv / drain| Drain
+    Drain --> App
+    App --> GPU
 ```
 
-### 3.2 Target (async loader)
+### 4.2 One tile still contains many map layers
+
+Important: **one HTTP MVT tile** already carries multiple domain layers:
+
+```text
+.pbf tile
+  ├─ Background fills   (water / landuse / …)
+  ├─ Roads              (transportation / …)
+  └─ Buildings          (building / …)
+```
+
+So Phase A does **not** download background/roads/buildings on three separate HTTP paths.
+
+Instead:
+
+```text
+Job: TileFetch(tile_id)
+  → bytes
+  → decode
+  → map to TileSceneData { Background, Roads, Buildings }
+  → one TileFetched result
+```
+
+Per-type work after that (mesh, style, GPU upload) can become **later job types** or stay on main thread until Phase C.
 
 ```mermaid
 flowchart LR
-    subgraph Main["Main thread / winit frame loop"]
-        Cam[CameraState]
-        Scene[SceneState]
-        GPU[Renderer upload/draw]
-    end
+    TF[TileFetch job] --> Scene[TileSceneData]
+    Scene --> BG[Background payload]
+    Scene --> RD[Roads payload]
+    Scene --> BD[Buildings payload]
 
-    subgraph Loader["Background TileLoader"]
-        Q[Request queue]
-        Tokio[tokio multi-thread runtime]
-        Prov[MvtProvider]
-    end
-
-    Cam -->|visible_tiles| Scene
-    Scene -->|TileRequest| Q
-    Q --> Tokio
-    Tokio --> Prov
-    Prov -->|TileResult| Scene
-    Scene -->|merge + upload| GPU
-```
-
-### 3.3 Per-frame sequence
-
-```mermaid
-sequenceDiagram
-    participant UI as Main thread
-    participant L as TileLoader
-    participant BG as Background tokio tasks
-
-    UI->>L: set_wanted(visible_tiles, priorities)
-    UI->>L: drain_results()
-    L-->>UI: Vec of Loaded / Failed
-    UI->>UI: update local cache / sticky / merge / upload / draw
-
-    Note over L,BG: happens in parallel, does not block UI
-    L->>BG: spawn fetch_tile(id)
-    BG-->>L: push TileResult
+    BG --> M1[Mesh/Upload<br/>main or future job]
+    RD --> M2[Mesh/Upload<br/>main or future job]
+    BD --> M3[Mesh/Upload<br/>main or future job]
 ```
 
 ---
 
-## 4. Proposed module boundaries
+## 5. Framework API sketch
 
-```text
-apps/native-viewer/
-  state/sceneState.rs     # thinner: cache, sticky, merge, upload
-  state/state.rs          # frame loop: request → drain → render
-
-crates/mw-provider-mvt/   # unchanged: pure async fetch/decode/map
-  or
-crates/mw-tile-loader/    # new (preferred): background scheduling + channels
-```
-
-Prefer a new `mw-tile-loader` crate (or a `loader` module first) so scheduling logic does not keep growing inside `SceneState`.
-
-### 4.1 Public API sketch
+Think of this as a tiny job system, not a tile-only loader.
 
 ```rust
-pub struct TileLoader { /* private: runtime handle + channels */ }
+/// Shared async data framework.
+pub struct DataTaskRuntime { /* tokio Handle, channels, caps */ }
 
-pub enum TileRequest {
-    EnsureProvider,
-    Fetch(TileId),
-    CancelExcept(HashSet<TileId>), // optional: drop in-flight outside view
+/// Every async data unit of work.
+pub enum DataJob {
+    TileFetch { tile_id: TileId, priority: u64 },
+    // Future examples:
+    // MeshBuild { key: MeshKey, features: ... },
+    // StyleResolve { zoom: u8, ... },
+    // GlyphAtlas { stack: String, range: ... },
 }
 
-pub enum TileResult {
-    ProviderReady { endpoint: String },
-    ProviderFailed { error: String },
-    Loaded { tile_id: TileId, scene: TileSceneData, elapsed_ms: f64 },
-    Failed { tile_id: TileId, error: String },
+/// Typed results back to the main thread.
+pub enum DataResult {
+    TileFetched {
+        tile_id: TileId,
+        scene: TileSceneData, // already split into Background/Roads/Buildings
+        elapsed_ms: f64,
+    },
+    TileFailed { tile_id: TileId, error: String },
+    // Future:
+    // MeshReady { key: MeshKey, buffers: ... },
+    // StyleReady { ... },
 }
 
-impl TileLoader {
-    pub fn new(config: MvtProviderConfig) -> anyhow::Result<Self>;
-    pub fn request_tiles(&self, tiles: &[(TileId, u64 /*priority*/)]);
-    pub fn drain_results(&self) -> Vec<TileResult>;
+impl DataTaskRuntime {
+    pub fn new() -> anyhow::Result<Self>;
+    pub fn submit(&self, job: DataJob);
+    pub fn submit_many(&self, jobs: impl IntoIterator<Item = DataJob>);
+    pub fn drain(&self) -> Vec<DataResult>;
     pub fn in_flight(&self) -> usize;
 }
 ```
 
-Main-thread pseudocode:
+Main-thread loop stays simple for **any** data type:
 
 ```rust
-loader.request_tiles(&missing_prioritized);
-for result in loader.drain_results() {
+runtime.submit_many(tile_jobs);
+for result in runtime.drain() {
     match result {
-        TileResult::Loaded { tile_id, scene, .. } => cache.insert(tile_id, scene),
-        TileResult::Failed { .. } => { /* log; retry later */ }
-        _ => {}
+        DataResult::TileFetched { tile_id, scene, .. } => cache.insert(tile_id, scene),
+        DataResult::TileFailed { .. } => { /* log / retry */ }
+        // later: MeshReady / StyleReady / ...
     }
 }
-// merge + upload stay on the main thread (needs wgpu Device/Queue)
 ```
 
 ---
 
-## 5. Rust / ecosystem capabilities used
+## 6. Job-type catalog (now vs later)
 
-| Capability | Role | Why |
-|------------|------|-----|
-| **`tokio` multi-thread runtime** | Run HTTP + decode in background | Already a dependency; `reqwest` needs tokio |
-| **`tokio::spawn` / `JoinHandle`** | One async task per tile | Parallel fetches instead of serial `block_on` |
-| **`std::sync::mpsc` or `crossbeam_channel` or `tokio::sync::mpsc`** | Main ↔ loader messages | Non-blocking `try_recv` / drain fits a frame loop |
-| **`Arc<MvtProvider>`** | Share provider across tasks | Provider is cloneable / shareable after init |
-| **`Arc<AtomicUsize>` / semaphore** | Cap in-flight downloads | Replaces today’s `MAX_TILES_PER_SYNC` as a concurrency limit |
-| **`Send + 'static` bounds** | Move `TileSceneData` across threads | Forces safe handoff of scene payloads |
-| **No main-thread `block_on`** | Keep frame rate alive | The core Phase A constraint |
+| Job type | Phase | Input | Output | Runs on |
+|----------|-------|-------|--------|---------|
+| **TileFetch** | A (now) | `TileId` | `TileSceneData` (all layers inside) | tokio async (+ maybe `spawn_blocking` for decode) |
+| **ProviderInit** | A (now) | config | ready endpoint / error | tokio async |
+| MeshBuild | later | features / style params | CPU mesh buffers | `spawn_blocking` or async |
+| StyleResolve | later | feature props + zoom | draw params | cheap CPU / async |
+| Glyph/AssetLoad | later | URL / key | bytes / atlas | tokio async |
+| DEM / Raster tile | later | tile id | image bytes | tokio async |
 
-### 5.1 Channel choice
-
-| Option | Pros | Cons |
-|--------|------|------|
-| `std::sync::mpsc` | Stdlib, simple | Multi-producer is awkward; backpressure is manual |
-| `crossbeam_channel` | Ergonomic, select | Extra dependency |
-| `tokio::sync::mpsc` | Fits tokio | Main thread must `try_recv`, never `.await` in the frame loop |
-
-**Phase A recommendation:** `std::sync::mpsc` or `crossbeam_channel`, with main-thread drain via `try_recv`.
-
-### 5.2 Keep GPU on the main thread
-
-Do **not** move `wgpu::Device` / `Queue` into the download thread.
-
-Why:
-
-- wgpu usage is simpler and safer when kept with the thread that owns the surface/frame loop
-- uploads must coordinate with swapchain lifetime
-- Phase A only fixes network stalls; mesh upload is usually cheap vs HTTP
+Phase A only **implements** TileFetch (+ ProviderInit), but the **framework shape** already assumes more job types.
 
 ---
 
-## 6. Trade-offs
+## 7. Rust capabilities (framework level)
 
-### 6.1 Async loader vs keep `block_on`
+| Capability | Framework role |
+|------------|----------------|
+| **`tokio` multi-thread runtime** | Shared executor for all data jobs |
+| **`tokio::spawn`** | Run each accepted job |
+| **`tokio::sync::Semaphore`** | Per-job-type or global concurrency caps |
+| **channels (`mpsc` / crossbeam)** | Job inbox + result outbox |
+| **`Arc`** | Share runtime handle / provider with tasks |
+| **enums `DataJob` / `DataResult`** | Typed extensibility for every data kind |
+| **`Send + 'static`** | Jobs/results cross threads safely |
+| **optional `spawn_blocking`** | CPU-heavy decode/mesh without stalling async workers |
 
-| | Async loader | Current `block_on` |
-|--|--------------|--------------------|
-| Frame time | Stable | Stalls on every slow request |
-| Complexity | Channels + lifetimes | Short code |
-| Debugging | Reordering / races | Easy sequential flow |
-| Cancellation | Needs an explicit policy | “done when this frame ends” |
-
-**Decision:** interactive maps need async; the complexity is worth it.
-
-### 6.2 One task per tile vs single worker queue
-
-| | Spawn per tile | Single serial worker |
-|--|----------------|----------------------|
-| Throughput | High (parallel HTTP) | Low |
-| Throttling | Needs a semaphore | Natural |
-| Implementation | Slightly harder | Simple |
-
-**Decision:** **bounded concurrency** (e.g. 4–8 in-flight), not unbounded spawn and not fully serial.
-
-### 6.3 Channel results to main cache vs shared `Mutex<HashMap>`
-
-| | Channel back to main | Shared mutex cache |
-|--|----------------------|--------------------|
-| Ownership | Clear | Lock contention, harder to reason about |
-| wgpu upload | Naturally on main | Still needs main-thread upload or locked upload |
-| Cancel / sticky | Main thread owns policy | Both sides must understand policy |
-
-**Decision:** download thread only emits `TileResult`; **cache / sticky / merge stay on the main thread** (preserve current `SceneState` semantics).
-
-### 6.4 Cancellation policy
-
-Fast camera motion makes old requests stale.
-
-| Strategy | Notes |
-|----------|-------|
-| **A. Ignore stale results** (do this first) | Drop result if `tile_id` is not in wanted/sticky |
-| B. Cancel `JoinHandle`s | Saves bandwidth; heavier |
-| C. Generation / epoch | Discard if `request_gen` mismatches |
-
-Phase A uses **A + optional epoch**.
-
-### 6.5 New crate vs existing crate
-
-| | New `mw-tile-loader` | Inside `mw-provider-mvt` | Inside native-viewer |
-|--|----------------------|--------------------------|----------------------|
-| Reuse | web-viewer can share | Possible | Hard to reuse |
-| Dependency direction | Depends on provider | Provider grows heavier | App stays bloated |
-| Clarity | Best boundary | Medium | Worst |
-
-**Decision:** prefer a dedicated module/crate; if workspace churn is a concern, start as `mw-provider-mvt::loader` and split later.
+This is why we say tokio tasks are a **framework**: they provide scheduling + concurrency for many job kinds, not only tiles.
 
 ---
 
-## 7. What the main thread still owns
+## 8. Trade-offs
 
-The loader does **not** take over (keeps Phase A scoped):
+### 8.1 General framework vs tile-only loader
 
-1. `CameraState::visible_tiles()` computation
-2. Sticky visible set (keep same-zoom tiles while wanted is incomplete)
-3. Zoom-based cache pruning
-4. `merge_tiles_into_scene_relative`
-5. Mesh-origin rebase
-6. `Renderer::upload_tile` / draw
+| | General `DataTaskRuntime` | Tile-only `TileLoader` |
+|--|---------------------------|-------------------------|
+| Extensibility | Add job types cleanly | New data → new ad-hoc thread code |
+| Upfront design | Slightly more abstract | Faster to hack |
+| Risk | Over-design if unused | Re-architect later |
 
-The loader only: **fetch tiles by priority and return `TileSceneData` asynchronously**.
+**Decision:** design the framework now; implement only TileFetch in Phase A.
+
+### 8.2 One TileFetch vs separate jobs per map layer
+
+| | One TileFetch → full `TileSceneData` | Separate BackgroundFetch / RoadFetch / BuildingFetch |
+|--|--------------------------------------|------------------------------------------------------|
+| Network | 1 HTTP GET per tile | Wasteful / usually impossible (same .pbf) |
+| Matches MVT | Yes | No for MapTiler/OpenMapTiles |
+| Per-type priority | After split, via later MeshBuild jobs | Fake at download layer |
+
+**Decision:** download stays **tile-scoped**. Per-type differentiation happens **after** decode (mesh/style/upload jobs later).
+
+### 8.3 Where concurrency caps live
+
+| | Global cap only | Cap per job type |
+|--|-----------------|------------------|
+| Simple | Yes | No |
+| Fairness | Tile flood can starve other jobs | Better when MeshBuild arrives |
+
+**Decision:** Phase A = global + TileFetch cap. Add per-type caps when second job type lands.
+
+### 8.4 Keep GPU on main thread
+
+Still true: framework does **data** work. `wgpu` Device/Queue stay on the UI/render thread. Future `MeshBuild` can return CPU buffers; upload remains main-thread.
 
 ---
 
-## 8. Migration steps
+## 9. What Phase A changes in the app
 
-1. Introduce `TileLoader` with its own tokio runtime (moved out of `SceneState`)
-2. Convert `ensure_provider` / `fetch_one_tile` into async messages
-3. Change `sync_visible_tiles` to:
-   - compute missing tiles
-   - `request_tiles`
-   - `drain_results` into cache
-   - merge/upload only when cache changed
-4. Remove all `block_on` from the render path
-5. Validate with fast pan/zoom: UI stays smooth; tiles fill in shortly after
+1. Extract `DataTaskRuntime` (new crate or module).
+2. Implement `DataJob::TileFetch` / `DataResult::TileFetched`.
+3. `SceneState` submits tile jobs + drains results (no `block_on`).
+4. Sticky / merge / upload stay on main thread.
+5. Document how Background / Roads / Buildings arrive inside one tile result (not three downloads).
 
-### Acceptance criteria
+### Acceptance
 
-- [ ] No `block_on` in the frame loop
-- [ ] Input latency does not spike while dragging
-- [ ] Tiles still load and appear (1–N frames delay is OK)
-- [ ] Same-zoom sticky behavior preserved
-- [ ] Failed tiles log and do not crash; later retry is allowed
-
----
-
-## 9. Risks and mitigations
-
-| Risk | Mitigation |
-|------|------------|
-| Out-of-order results | Key by `TileId`; merge uses sets, not arrival order |
-| Memory growth (too many results) | Bounded result queue; drop non-wanted results |
-| Duplicate fetches | `in_flight: HashSet<TileId>` dedupe |
-| Tasks still running on exit | Close sender on `Drop`; tasks exit when channel disconnects |
-| Decode burns CPU | Consider `spawn_blocking` later for heavy decode |
+- [ ] Frame loop has no `block_on`
+- [ ] API is job-typed (`DataJob` / `DataResult`), not tile-only names forever
+- [ ] TileFetch returns full scene with Background + Roads + Buildings
+- [ ] UI stays responsive while tiles stream in
+- [ ] Adding a second job type later does not require a new threading model
 
 ---
 
 ## 10. Summary
 
-Phase A uses Rust **ownership + channels + tokio tasks** to move I/O off the UI thread, instead of `block_on` inside a map frame loop.
+- **Framework:** tokio-powered `DataTaskRuntime` for all async data jobs  
+- **First job:** `TileFetch`  
+- **Map layer types** (Background / Roads / Buildings): split **inside** a fetched tile, then processed by later stages/jobs  
+- **Main thread:** decide, drain, upload, draw  
 
 One line:
 
-> **Main thread decides and draws; background thread downloads and decodes; they meet through messages.**
-
-Chinese version: [`phase-a-async-tile-loader.zh.md`](./phase-a-async-tile-loader.zh.md)
+> **Tokio hosts the data-task framework; each data kind is a job type; tiles are only the first job.**

@@ -1,0 +1,13 @@
+[package]
+name = "mw-async-data"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Shared tokio data-task runtime for MapWeave (TileFetch first)"
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+mw-core = { path = "../mw-core" }
+mw-provider-mvt = { path = "../mw-provider-mvt" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }

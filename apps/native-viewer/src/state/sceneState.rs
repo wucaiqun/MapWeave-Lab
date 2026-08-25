@@ -2,18 +2,19 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use anyhow::Context;
+use mw_async_data::{DataJob, DataResult, DataTaskRuntime};
 use mw_core::{
     merge_tiles_into_scene_relative, tile_world_origin, world_units_per_tile, LayerPayload, TileId,
     TileSceneData,
 };
-use mw_provider_mvt::{MvtProvider, MvtProviderConfig, TileProvider};
+use mw_provider_mvt::MvtProviderConfig;
 use mw_render_wgpu::{BackgroundLayer, BuildingsLayer, Renderer, RendererConfig, RoadsLayer};
 use mw_telemetry::{elapsed_ms, print_perf_if};
 
 use super::CameraState;
 
-/// Max new tile loads per frame (bandwidth throttle only — not a tile-count cap).
-const MAX_TILES_PER_SYNC: usize = 9;
+/// How many new TileFetch jobs to submit per frame (fills up to runtime concurrency).
+const MAX_TILE_SUBMITS_PER_FRAME: usize = 9;
 
 /// Rebase camera-relative mesh when the look-at drifts farther than this (world units).
 const MESH_REBASE_DISTANCE: f64 = 512.0;
@@ -42,15 +43,12 @@ pub struct SyncTimings {
     pub tiles_fetched: u32,
 }
 
-enum TileSource {
-    Unresolved(MvtProviderConfig),
-    Ready(MvtProvider),
-}
-
 pub struct SceneState {
     pub renderer: Renderer,
-    tile_source: TileSource,
-    runtime: tokio::runtime::Runtime,
+    data_runtime: DataTaskRuntime,
+    provider_config: MvtProviderConfig,
+    provider_ready: bool,
+    provider_init_inflight: bool,
     tiles: HashMap<TileId, TileSceneData>,
     visible: HashSet<TileId>,
     merged: TileSceneData,
@@ -77,10 +75,18 @@ impl SceneState {
         renderer.add_layer(Box::new(RoadsLayer::default()));
         renderer.add_layer(Box::new(BuildingsLayer::default()));
 
+        let data_runtime = DataTaskRuntime::new().context("failed to create data task runtime")?;
+        let provider_config = MvtProviderConfig::default();
+        data_runtime.submit(DataJob::ProviderInit {
+            config: provider_config.clone(),
+        });
+
         Ok(Self {
             renderer,
-            tile_source: TileSource::Unresolved(MvtProviderConfig::default()),
-            runtime: tokio::runtime::Runtime::new().context("failed to create tokio runtime")?,
+            data_runtime,
+            provider_config,
+            provider_ready: false,
+            provider_init_inflight: true,
             tiles: HashMap::new(),
             visible: HashSet::new(),
             merged: TileSceneData {
@@ -95,32 +101,63 @@ impl SceneState {
         self.renderer.prepare(device, surface_format)
     }
 
-    fn ensure_provider(&mut self) -> bool {
-        loop {
-            match &self.tile_source {
-                TileSource::Ready(_) => return true,
-                TileSource::Unresolved(config) => {
-                    let config = config.clone();
-                    match self
-                        .runtime
-                        .block_on(MvtProvider::with_resolved_config(config))
-                    {
-                        Ok(provider) => {
-                            log::info!("tile endpoint: {}", provider.config.endpoint_template);
-                            self.tile_source = TileSource::Ready(provider);
-                        }
-                        Err(err) => {
-                            log::warn!("tile endpoint not ready yet: {err:#}");
-                            return false;
-                        }
-                    }
+    fn drain_data_results(&mut self, tile_fetch_ms: &mut f64, tiles_fetched: &mut u32) -> bool {
+        let mut loaded_any = false;
+        for result in self.data_runtime.drain() {
+            match result {
+                DataResult::ProviderReady { endpoint } => {
+                    log::info!("tile endpoint: {endpoint}");
+                    self.provider_ready = true;
+                    self.provider_init_inflight = false;
+                }
+                DataResult::ProviderFailed { error } => {
+                    log::warn!("tile endpoint not ready yet: {error}");
+                    self.provider_ready = false;
+                    self.provider_init_inflight = false;
+                }
+                DataResult::TileFetched {
+                    tile_id,
+                    scene,
+                    elapsed_ms,
+                } => {
+                    *tile_fetch_ms += elapsed_ms;
+                    *tiles_fetched += 1;
+                    log::info!(
+                        "loaded tile {}/{}/{} in {elapsed_ms:.1}ms ({} bg, {} bldg, {} roads)",
+                        scene.tile_id.z,
+                        scene.tile_id.x,
+                        scene.tile_id.y,
+                        count_background(&scene),
+                        count_buildings(&scene),
+                        count_roads(&scene),
+                    );
+                    self.tiles.insert(tile_id, scene);
+                    loaded_any = true;
+                }
+                DataResult::TileFailed { tile_id, error } => {
+                    log::warn!(
+                        "failed to fetch tile {}/{}/{}: {error}",
+                        tile_id.z,
+                        tile_id.x,
+                        tile_id.y,
+                    );
                 }
             }
         }
+        loaded_any
     }
 
-    /// Resolve the tile endpoint (once) and fetch missing tiles incrementally.
-    /// Never fails the caller — errors are logged and retried on later frames.
+    fn ensure_provider_requested(&mut self) {
+        if self.provider_ready || self.provider_init_inflight {
+            return;
+        }
+        self.provider_init_inflight = true;
+        self.data_runtime.submit(DataJob::ProviderInit {
+            config: self.provider_config.clone(),
+        });
+    }
+
+    /// Non-blocking tile sync: submit jobs, drain results, merge/upload on main thread.
     pub fn sync_visible_tiles(
         &mut self,
         camera: &mut CameraState,
@@ -143,7 +180,10 @@ impl SceneState {
             self.visible.retain(|id| id.z == tile_zoom);
         }
 
-        if !self.ensure_provider() {
+        let loaded_any = self.drain_data_results(&mut tile_fetch_ms, &mut tiles_fetched);
+        self.ensure_provider_requested();
+
+        if !self.provider_ready {
             return SyncTimings {
                 total_ms: elapsed_ms(sync_start),
                 tile_fetch_ms,
@@ -165,49 +205,33 @@ impl SceneState {
             ((dx * dx + dz * dz) * 1_000.0) as u64
         });
         let wanted_set: HashSet<TileId> = wanted.iter().copied().collect();
+
+        let mut submitted = 0usize;
+        for (priority, tile_id) in wanted.iter().copied().enumerate() {
+            if submitted >= MAX_TILE_SUBMITS_PER_FRAME {
+                break;
+            }
+            if self.tiles.contains_key(&tile_id) {
+                continue;
+            }
+            if self.data_runtime.is_tile_in_flight(tile_id) {
+                continue;
+            }
+            self.data_runtime.submit(DataJob::TileFetch {
+                tile_id,
+                priority: priority as u64,
+            });
+            submitted += 1;
+        }
+
+        // Drain again in case fast cache hits completed during submit.
+        let loaded_any = loaded_any || self.drain_data_results(&mut tile_fetch_ms, &mut tiles_fetched);
+
         let missing: Vec<TileId> = wanted
             .iter()
             .copied()
             .filter(|id| !self.tiles.contains_key(id))
             .collect();
-
-        let mut fetched = 0usize;
-        let mut loaded_any = false;
-
-        for tile_id in &missing {
-            if fetched >= MAX_TILES_PER_SYNC {
-                break;
-            }
-            fetched += 1;
-
-            let fetch_start = Instant::now();
-            match self.fetch_one_tile(*tile_id) {
-                Ok(scene) => {
-                    let fetch_ms = elapsed_ms(fetch_start);
-                    tile_fetch_ms += fetch_ms;
-                    tiles_fetched += 1;
-                    log::info!(
-                        "loaded tile {}/{}/{} in {fetch_ms:.1}ms ({} bg, {} bldg, {} roads)",
-                        scene.tile_id.z,
-                        scene.tile_id.x,
-                        scene.tile_id.y,
-                        count_background(&scene),
-                        count_buildings(&scene),
-                        count_roads(&scene),
-                    );
-                    self.tiles.insert(*tile_id, scene);
-                    loaded_any = true;
-                }
-                Err(err) => {
-                    log::warn!(
-                        "failed to fetch tile {}/{}/{}: {err:#}",
-                        tile_id.z,
-                        tile_id.x,
-                        tile_id.y,
-                    );
-                }
-            }
-        }
 
         let ready_wanted: HashSet<TileId> = wanted_set
             .iter()
@@ -248,12 +272,14 @@ impl SceneState {
             };
         }
         if display.is_empty() {
-            log::warn!(
-                "sync: nothing to display (wanted={}, cached={}, missing={})",
-                wanted_set.len(),
-                self.tiles.len(),
-                missing.len(),
-            );
+            // Still waiting for first tiles — not an error while in-flight.
+            if self.data_runtime.in_flight() == 0 && missing.is_empty() {
+                log::warn!(
+                    "sync: nothing to display (wanted={}, cached={})",
+                    wanted_set.len(),
+                    self.tiles.len(),
+                );
+            }
             return SyncTimings {
                 total_ms: elapsed_ms(sync_start),
                 tile_fetch_ms,
@@ -266,7 +292,7 @@ impl SceneState {
         let prev_visible = self.visible.len();
         let bbox = camera.ground_bbox();
         log::info!(
-            "sync: cam target=({:.0},{:.0}) dist={:.0} yaw={:.2} pitch={:.2} z={} | wanted={} ready={} missing={} sticky={} display={} (prev={}) rebase={needs_rebase} | tiles=[{}] bbox=[{:.0},{:.0}]x[{:.0},{:.0}]",
+            "sync: cam target=({:.0},{:.0}) dist={:.0} yaw={:.2} pitch={:.2} z={} | wanted={} ready={} missing={} inflight={} sticky={} display={} (prev={}) rebase={needs_rebase} | tiles=[{}] bbox=[{:.0},{:.0}]x[{:.0},{:.0}]",
             origin[0],
             origin[1],
             camera.distance(),
@@ -276,6 +302,7 @@ impl SceneState {
             wanted_set.len(),
             ready_wanted.len(),
             missing.len(),
+            self.data_runtime.in_flight(),
             sticky_retained,
             display.len(),
             prev_visible,
@@ -339,14 +366,6 @@ impl SceneState {
             upload_ms,
             tiles_fetched,
         }
-    }
-
-    fn fetch_one_tile(&mut self, tile_id: TileId) -> anyhow::Result<TileSceneData> {
-        let TileSource::Ready(provider) = &self.tile_source else {
-            anyhow::bail!("tile provider not ready");
-        };
-        let provider = provider.clone();
-        self.runtime.block_on(provider.fetch_tile(tile_id))
     }
 
     pub fn clear_color(&self) -> wgpu::Color {

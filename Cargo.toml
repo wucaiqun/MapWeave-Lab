@@ -2,6 +2,7 @@
 members = [
     "crates/mw-core",
     "crates/mw-provider-mvt",
+    "crates/mw-async-data",
     "crates/mw-render-wgpu",
     "crates/mw-telemetry",
     "apps/native-viewer",
