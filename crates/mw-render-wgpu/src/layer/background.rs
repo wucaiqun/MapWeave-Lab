@@ -257,7 +257,7 @@ impl RenderLayer for BackgroundLayer {
             return RenderStats::default();
         }
 
-        let uniforms: BackgroundUniforms = BackgroundUniforms {
+        let uniforms = BackgroundUniforms {
             view_proj: frame.view_proj,
             color: self.fill_color,
         };

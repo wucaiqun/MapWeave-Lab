@@ -136,8 +136,17 @@ impl State {
             .scene
             .mesh_origin()
             .unwrap_or_else(|| self.camera.target_world());
+        let dist = self.camera.distance();
         let frame = FrameUniforms {
             view_proj: self.camera.view_proj_cols_for(mesh_origin),
+            inv_view_proj: self.camera.inv_view_proj_cols_for(mesh_origin),
+            camera_pos: self.camera.eye_relative_to(mesh_origin),
+            _pad0: 0.0,
+            fog_color: [0.72, 0.80, 0.90, 1.0],
+            // Eye-distance range: start near the look distance, fade out past it.
+            fog_start: dist * 0.9,
+            fog_end: dist * 2.4,
+            _pad1: [0.0; 2],
         };
 
         let (render_ms, render_stats) = self.render

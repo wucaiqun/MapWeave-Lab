@@ -7,4 +7,5 @@ edition = "2024"
 anyhow.workspace = true
 bytemuck = { workspace = true, features = ["derive"] }
 mw-core = { path = "../mw-core" }
+mw-assets = { path = "../mw-assets" }
 wgpu.workspace = true

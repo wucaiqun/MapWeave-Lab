@@ -158,6 +158,32 @@ impl RenderState {
             stats = renderer.render(&mut pass, &self.queue, frame);
         }
 
+        // Second pass: sample stored depth, alpha-blend fog over the scene.
+        {
+            let mut fog_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("fog"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            stats.merge(renderer.fog.render(
+                &mut fog_pass,
+                &self.device,
+                &self.queue,
+                frame,
+                &self.depth_view,
+            ));
+        }
+
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
@@ -181,7 +207,7 @@ fn create_depth_targets(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());

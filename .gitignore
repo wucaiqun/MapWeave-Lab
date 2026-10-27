@@ -1,0 +1,11 @@
+/target/
+**/target/
+data-cache-root/
+data-cache-openfreemap/
+**/data-cache-openfreemap/
+source/
+*.log
+.DS_Store
+.idea/
+.cargo-home/
+.cargo/

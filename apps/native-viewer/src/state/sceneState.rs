@@ -8,7 +8,7 @@ use mw_core::{
     TileSceneData,
 };
 use mw_provider_mvt::MvtProviderConfig;
-use mw_render_wgpu::{BackgroundLayer, BuildingsLayer, Renderer, RendererConfig, RoadsLayer};
+use mw_render_wgpu::{BackgroundLayer, BuildingsLayer, Renderer, RendererConfig, RoadsLayer, SkyboxLayer};
 use mw_telemetry::{elapsed_ms, print_perf_if};
 
 use super::CameraState;
@@ -71,6 +71,8 @@ impl SceneState {
                 a: 1.0,
             },
         });
+        // Sky first (behind map layers).
+        renderer.add_layer(Box::new(SkyboxLayer::default()));
         renderer.add_layer(Box::new(BackgroundLayer::default()));
         renderer.add_layer(Box::new(RoadsLayer::default()));
         renderer.add_layer(Box::new(BuildingsLayer::default()));

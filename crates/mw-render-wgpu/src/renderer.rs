@@ -1,6 +1,6 @@
 use mw_core::TileSceneData;
 
-use crate::{FrameUniforms, RenderLayer, RenderStats};
+use crate::{FogLayer, FrameUniforms, RenderLayer, RenderStats};
 
 /// Shared depth buffer format for all opaque/map layers.
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -12,6 +12,8 @@ pub struct RendererConfig {
 pub struct Renderer {
     pub config: RendererConfig,
     pub layers: Vec<Box<dyn RenderLayer + Send + Sync>>,
+    /// Post-process depth fog (second pass). Not a [`RenderLayer`].
+    pub fog: FogLayer,
 }
 
 impl Renderer {
@@ -19,6 +21,7 @@ impl Renderer {
         Self {
             config,
             layers: Vec::new(),
+            fog: FogLayer::default(),
         }
     }
 
@@ -30,6 +33,7 @@ impl Renderer {
         for layer in &mut self.layers {
             layer.prepare(device, surface_format)?;
         }
+        self.fog.prepare(device, surface_format)?;
         Ok(())
     }
 

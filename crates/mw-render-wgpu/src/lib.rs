@@ -4,6 +4,8 @@ mod renderer;
 mod stats;
 
 pub use frame::FrameUniforms;
-pub use layer::{BackgroundLayer, BuildingsLayer, RenderLayer, RoadsLayer};
+pub use layer::{
+    BackgroundLayer, BuildingsLayer, FogLayer, RenderLayer, RoadsLayer, SkyboxLayer,
+};
 pub use renderer::{Renderer, RendererConfig, DEPTH_FORMAT};
 pub use stats::RenderStats;

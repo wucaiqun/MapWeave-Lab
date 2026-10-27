@@ -102,6 +102,23 @@ impl CameraState {
         self.view_proj_relative_to(mesh_origin).to_cols_array_2d()
     }
 
+    pub fn inv_view_proj_cols_for(&self, mesh_origin: [f64; 2]) -> [[f32; 4]; 4] {
+        self.view_proj_relative_to(mesh_origin)
+            .inverse()
+            .to_cols_array_2d()
+    }
+
+    /// Eye position in camera-relative mesh space (`world - mesh_origin`).
+    pub fn eye_relative_to(&self, mesh_origin: [f64; 2]) -> [f32; 3] {
+        let residual = glam::Vec3::new(
+            (self.target_x - mesh_origin[0]) as f32,
+            0.0,
+            (self.target_z - mesh_origin[1]) as f32,
+        );
+        let eye = residual + self.eye_offset();
+        [eye.x, eye.y, eye.z]
+    }
+
     pub fn zoom(&self) -> u8 {
         self.zoom
     }
@@ -116,6 +133,14 @@ impl CameraState {
 
     pub fn pitch(&self) -> f32 {
         self.pitch
+    }
+
+    pub fn near(&self) -> f32 {
+        self.near
+    }
+
+    pub fn far(&self) -> f32 {
+        self.far
     }
 
     /// Update tile LOD from the current ground footprint width.

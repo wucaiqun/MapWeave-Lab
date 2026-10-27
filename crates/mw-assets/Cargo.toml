@@ -1,0 +1,16 @@
+[package]
+name = "mw-assets"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Asset path resolution, image decode, cubemap split, and color tables"
+
+[dependencies]
+anyhow.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+log.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
